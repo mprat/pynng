@@ -4,6 +4,7 @@ Provides a Pythonic interface to cffi nng bindings
 
 
 import logging
+import threading
 
 from ._nng import ffi, lib
 from .exceptions import check_err, ConnectionRefused
@@ -237,9 +238,9 @@ class Socket:
         self._on_pre_pipe_add = []
         self._on_post_pipe_add = []
         self._on_post_pipe_remove = []
-
-        self._socket = ffi.new('nng_socket *',)
+        self._pipe_notify_lock = threading.Lock()
         self._async_backend = async_backend
+        self._socket = ffi.new('nng_socket *',)
         if opener is not None:
             self._opener = opener
         if opener is None and not hasattr(self, '_opener'):
@@ -415,7 +416,9 @@ class Socket:
         self._pipes[pipe_id] = pipe
         return pipe
 
-    def _remove_pipe(self, pipe_id):
+    def _remove_pipe(self, lib_pipe):
+        print(f'{self.name} removed')
+        pipe_id = lib.nng_pipe_id(lib_pipe)
         del self._pipes[pipe_id]
 
     def new_context(self):
@@ -768,22 +771,38 @@ class Context:
 @ffi.def_extern()
 def _nng_pipe_cb(lib_pipe, event, arg):
     sock = ffi.from_handle(arg)
-    pipe_id = lib.nng_pipe_id(lib_pipe)
-    if event == lib.NNG_PIPE_EV_ADD_PRE:
-        # time to do our bookkeeping; actually create the pipe and attach it to
-        # the socket
-        pipe = sock._add_pipe(lib_pipe)
-        for cb in sock._on_pre_pipe_add:
-            cb(pipe)
-    elif event == lib.NNG_PIPE_EV_ADD_POST:
-        pipe = sock._pipes[pipe_id]
-        for cb in sock._on_post_pipe_add:
-            cb(pipe)
-    elif event == lib.NNG_PIPE_EV_REM_POST:
-        pipe = sock._pipes[pipe_id]
-        for cb in sock._on_post_pipe_remove:
-            cb(pipe)
-        sock._remove_pipe(pipe_id)
+    with sock._pipe_notify_lock:
+        print(f'{sock.name}: {event}')
+        pipe_id = lib.nng_pipe_id(lib_pipe)
+        if event == lib.NNG_PIPE_EV_ADD_PRE:
+            # time to do our bookkeeping; actually create the pipe and attach it to
+            # the socket
+            pipe = sock._add_pipe(lib_pipe)
+            for cb in sock._on_pre_pipe_add:
+                cb(pipe)
+            print(f'{sock.name} pre here')
+            if pipe.closed:
+                # NB: we need to remove the pipe from socket now, before a remote
+                # tries connecting again and the same pipe ID may be reused.  This
+                # will result in a KeyError below.
+                print(f'{sock.name} pre here')
+                sock._remove_pipe(lib_pipe)
+        elif event == lib.NNG_PIPE_EV_ADD_POST:
+            pipe = sock._pipes[pipe_id]
+            for cb in sock._on_post_pipe_add:
+                cb(pipe)
+        elif event == lib.NNG_PIPE_EV_REM_POST:
+            try:
+                pipe = sock._pipes[pipe_id]
+            except KeyError:
+                # we get here if the pipe was closed in pre_connect earlier. This
+                # is not a big deal.
+                logger.debug('Could not find pipe for socket %s', sock.name)
+            else:
+                for cb in sock._on_post_pipe_remove:
+                    cb(pipe)
+                print(f'{sock.name} post here')
+                sock._remove_pipe(lib_pipe)
 
 
 class Pipe:
